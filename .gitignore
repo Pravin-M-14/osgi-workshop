@@ -1,0 +1,19 @@
+# Tycho / Maven build output
+target/
+bin/
+*.class
+
+# Eclipse
+# NB: .project and .classpath are deliberately NOT ignored. They are PDE
+# project descriptors that shipped with the product and are part of the
+# source; ignoring them would silently drop 31 files from the repo.
+# .settings/ holds per-workspace preferences and none shipped, so it stays out.
+.settings/
+
+# Pipeline output: regenerated on every run
+build-reports/
+.oms-build-state.json
+
+# Python
+__pycache__/
+*.py[cod]

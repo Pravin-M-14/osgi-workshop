@@ -1,0 +1,543 @@
+name: OMS Build Pipeline
+
+# Smart build pipeline for the Northwind Order Management System.
+#
+# The product is an Eclipse/Tycho OSGi reactor whose real dependencies live in
+# META-INF/MANIFEST.MF and feature.xml, not in the POMs -- every plugin POM is
+# a three-line `eclipse-plugin` stanza with no <dependencies> at all. No
+# off-the-shelf action can therefore work out what a change affects: path
+# filters know which files moved but nothing about what consumes them, and
+# affected-graph tools assume the graph is declared in the build config.
+#
+# So this workflow splits the problem in two:
+#   * the `plan` job runs the resolver in build-pipeline/, which parses the OSGi
+#     metadata, topologically sorts the graph into waves, and computes the
+#     reverse-reachable impact set of the change;
+#   * the `wave-*` jobs do nothing but build what the plan told them to.
+#
+# Scenario 1 (build everything)     -> push to main, or dispatch with scenario=full
+# Scenario 2 (build only what changed) -> pull requests, or dispatch with scenario=changed
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Which build scenario to run
+        type: choice
+        options: [auto, full, changed]
+        default: auto
+      build_mode:
+        description: >
+          matrix = one job per module, waves in parallel (best visibility);
+          single-runner = one job, waves sequential with mvn -T (fastest for a
+          reactor this small, no artifact hand-off)
+        type: choice
+        options: [matrix, single-runner]
+        default: matrix
+      plan_only:
+        description: Compute and publish the plan and graph, but do not compile
+        type: boolean
+        default: false
+      base_ref:
+        description: Git ref to diff against in the changed scenario (blank = auto)
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REACTOR_ROOT: osgi-workshop
+  REPORT_DIR: build-reports
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Test the resolver itself.
+  #
+  # Everything downstream trusts one thing: that the resolver derived the right
+  # graph. If the manifest parser or the topological sort is wrong the pipeline
+  # does not fail -- it quietly builds the wrong subset, which is far worse. So
+  # `plan` gates on this. The suite is stdlib unittest only and takes a couple
+  # of seconds, so the serialisation costs almost nothing.
+  # ---------------------------------------------------------------------------
+  resolver-tests:
+    name: Test resolver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile the resolver
+        run: python -m compileall -q build-pipeline/omsbuild
+
+      - name: Run the resolver test suite
+        env:
+          PYTHONPATH: build-pipeline
+        run: |
+          echo "::group::unit tests"
+          python -m unittest discover -s build-pipeline/tests -v
+          echo "::endgroup::"
+
+      - name: Check the workflow and composite action parse as YAML
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit("PyYAML missing on the runner")
+          for path in (
+              ".github/workflows/build-pipeline.yml",
+              ".github/actions/build-module/action.yml",
+          ):
+              yaml.safe_load(pathlib.Path(path).read_text())
+              print(f"OK {path}")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 1. Decide what to build. No JDK, no Maven -- this job only reads metadata.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan build
+    needs: [resolver-tests]
+    runs-on: ubuntu-latest
+    outputs:
+      scenario: ${{ steps.plan.outputs.scenario }}
+      should_build: ${{ steps.gate.outputs.should_build }}
+      build_mode: ${{ steps.gate.outputs.build_mode }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      module_total: ${{ steps.plan.outputs.module_total }}
+      module_count: ${{ steps.plan.outputs.module_count }}
+      changed_count: ${{ steps.plan.outputs.changed_count }}
+      skipped_count: ${{ steps.plan.outputs.skipped_count }}
+      wave_count: ${{ steps.plan.outputs.wave_count }}
+      all_module_paths: ${{ steps.plan.outputs.all_module_paths }}
+      wave1_matrix: ${{ steps.plan.outputs.wave1_matrix }}
+      wave2_matrix: ${{ steps.plan.outputs.wave2_matrix }}
+      wave3_matrix: ${{ steps.plan.outputs.wave3_matrix }}
+      wave4_matrix: ${{ steps.plan.outputs.wave4_matrix }}
+      wave5_matrix: ${{ steps.plan.outputs.wave5_matrix }}
+      wave6_matrix: ${{ steps.plan.outputs.wave6_matrix }}
+      wave1_has_work: ${{ steps.plan.outputs.wave1_has_work }}
+      wave2_has_work: ${{ steps.plan.outputs.wave2_has_work }}
+      wave3_has_work: ${{ steps.plan.outputs.wave3_has_work }}
+      wave4_has_work: ${{ steps.plan.outputs.wave4_has_work }}
+      wave5_has_work: ${{ steps.plan.outputs.wave5_has_work }}
+      wave6_has_work: ${{ steps.plan.outputs.wave6_has_work }}
+      wave1_paths: ${{ steps.plan.outputs.wave1_paths }}
+      wave2_paths: ${{ steps.plan.outputs.wave2_paths }}
+      wave3_paths: ${{ steps.plan.outputs.wave3_paths }}
+      wave4_paths: ${{ steps.plan.outputs.wave4_paths }}
+      wave5_paths: ${{ steps.plan.outputs.wave5_paths }}
+      wave6_paths: ${{ steps.plan.outputs.wave6_paths }}
+      overflow_has_work: ${{ steps.plan.outputs.overflow_has_work }}
+      overflow_paths: ${{ steps.plan.outputs.overflow_paths }}
+
+    steps:
+      # Full history: the changed scenario needs the merge base with the target
+      # branch, which a shallow clone cannot compute.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Graphviz turns the computed graph into embeddable SVG/PNG. Without it
+      # the resolver still emits DOT and Mermaid, so this is an enhancement
+      # rather than a hard requirement.
+      - name: Install Graphviz
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends graphviz
+
+      - name: Resolve scenario and base ref
+        id: context
+        run: |
+          requested='${{ inputs.scenario }}'
+          if [ -z "$requested" ] || [ "$requested" = "auto" ]; then
+            case "${{ github.event_name }}" in
+              pull_request) scenario=changed ;;
+              push)         scenario=full ;;
+              *)            scenario=changed ;;
+            esac
+          else
+            scenario="$requested"
+          fi
+
+          base='${{ inputs.base_ref }}'
+          if [ -z "$base" ]; then
+            if [ -n "${{ github.base_ref }}" ]; then
+              base="origin/${{ github.base_ref }}"
+            elif [ "${{ github.event_name }}" = "push" ] && \
+                 [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              base='${{ github.event.before }}'
+            else
+              base="HEAD~1"
+            fi
+          fi
+
+          echo "scenario=$scenario" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base"     >> "$GITHUB_OUTPUT"
+          echo "Resolved scenario=$scenario, base ref=$base"
+
+      - name: Make base ref available
+        if: steps.context.outputs.scenario == 'changed'
+        run: |
+          # HEAD~1 and explicit SHAs need no fetching; named remote branches do.
+          case "${{ steps.context.outputs.base_ref }}" in
+            origin/*)
+              git fetch --no-tags --depth=0 origin \
+                "${{ github.base_ref || 'main' }}:refs/remotes/origin/${{ github.base_ref || 'main' }}" || true
+              ;;
+          esac
+          git rev-parse --verify "${{ steps.context.outputs.base_ref }}" \
+            || echo "::warning::base ref not resolvable; the resolver will fall back"
+
+      # The single decision point. Everything downstream just reads its output.
+      - name: Compute build plan, impact set and dependency graph
+        id: plan
+        run: |
+          ./build-pipeline/oms-build \
+            --root "$REACTOR_ROOT" \
+            --report-dir "$REPORT_DIR" \
+            ci \
+            --scenario "${{ steps.context.outputs.scenario }}" \
+            --strategy git \
+            --ref "${{ steps.context.outputs.base_ref }}" \
+            --comment-file "$REPORT_DIR/pr-comment.md" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Decide whether to compile
+        id: gate
+        run: |
+          plan_only='${{ inputs.plan_only }}'
+          has_work='${{ steps.plan.outputs.has_work }}'
+          mode='${{ inputs.build_mode }}'
+          [ -n "$mode" ] || mode=matrix
+
+          if [ "$plan_only" = "true" ]; then
+            should_build=false
+            echo "::notice::plan_only requested -- publishing the plan and graph without compiling"
+          elif [ "$has_work" != "true" ]; then
+            should_build=false
+            echo "::notice::no module is affected by this change -- nothing to compile"
+          else
+            should_build=true
+          fi
+
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "build_mode=$mode"           >> "$GITHUB_OUTPUT"
+
+      - name: Upload dependency graph and reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: oms-dependency-graph
+          path: ${{ env.REPORT_DIR }}
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Forks cannot be granted pull-requests:write, so this is skipped there
+      # rather than failing the run.
+      - name: Comment the impact analysis on the pull request
+        if: >
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- oms-build-pipeline -->';
+            const path = `${process.env.REPORT_DIR}/pr-comment.md`;
+            if (!fs.existsSync(path)) {
+              core.info('no comment body was produced');
+              return;
+            }
+            const body = fs.readFileSync(path, 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = existing.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment(
+                { owner, repo, comment_id: mine.id, body });
+              core.info(`updated comment ${mine.id}`);
+            } else {
+              await github.rest.issues.createComment(
+                { owner, repo, issue_number, body });
+              core.info('created a new comment');
+            }
+
+  # ---------------------------------------------------------------------------
+  # 2. Build. Six wave jobs form a fixed ladder because Actions can fan a job
+  #    out dynamically but cannot create a dynamic *chain* of jobs. Each wave
+  #    skips itself when the plan gave it no modules.
+  #
+  #    The `!cancelled() && !contains(needs.*.result, 'failure')` guard is what
+  #    lets a wave run when an earlier wave was skipped (empty) rather than
+  #    failed -- a plain `needs:` would skip the whole rest of the ladder.
+  # ---------------------------------------------------------------------------
+  wave-1:
+    name: "W1 ${{ matrix.short }}"
+    needs: plan
+    if: >
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave1_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave1_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "1"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  wave-2:
+    name: "W2 ${{ matrix.short }}"
+    needs: [plan, wave-1]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave2_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave2_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "2"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  wave-3:
+    name: "W3 ${{ matrix.short }}"
+    needs: [plan, wave-1, wave-2]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave3_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave3_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "3"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  wave-4:
+    name: "W4 ${{ matrix.short }}"
+    needs: [plan, wave-1, wave-2, wave-3]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave4_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave4_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "4"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  wave-5:
+    name: "W5 ${{ matrix.short }}"
+    needs: [plan, wave-1, wave-2, wave-3, wave-4]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave5_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave5_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "5"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  wave-6:
+    name: "W6 ${{ matrix.short }}"
+    needs: [plan, wave-1, wave-2, wave-3, wave-4, wave-5]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.wave6_has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.wave6_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: ${{ matrix.module }}
+          path: ${{ matrix.path }}
+          wave: "6"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  # Safety valve: if the graph ever grows deeper than the ladder, the remaining
+  # waves are built in order on one runner rather than being silently dropped.
+  wave-overflow:
+    name: "W7+ remaining waves"
+    needs: [plan, wave-1, wave-2, wave-3, wave-4, wave-5, wave-6]
+    if: >
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'matrix' &&
+      needs.plan.outputs.overflow_has_work == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-module
+        with:
+          module: overflow
+          path: ${{ needs.plan.outputs.overflow_paths }}
+          wave: "7"
+          reactor-root: ${{ env.REACTOR_ROOT }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Alternative build mode. For a reactor of this size the artifact hand-off
+  #    between wave jobs costs more than the parallelism buys, so one runner
+  #    that walks the waves in order -- with Maven's own -T for intra-wave
+  #    parallelism and a naturally shared local repository -- is usually faster.
+  #    Selectable via workflow_dispatch so the trade-off is measurable.
+  # ---------------------------------------------------------------------------
+  single-runner-build:
+    name: Build (single runner, waves in order)
+    needs: plan
+    if: >
+      needs.plan.outputs.should_build == 'true' &&
+      needs.plan.outputs.build_mode == 'single-runner'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Build each wave in dependency order
+        working-directory: ${{ env.REACTOR_ROOT }}
+        run: |
+          set -o pipefail
+          waves=(
+            '${{ needs.plan.outputs.wave1_paths }}'
+            '${{ needs.plan.outputs.wave2_paths }}'
+            '${{ needs.plan.outputs.wave3_paths }}'
+            '${{ needs.plan.outputs.wave4_paths }}'
+            '${{ needs.plan.outputs.wave5_paths }}'
+            '${{ needs.plan.outputs.wave6_paths }}'
+            '${{ needs.plan.outputs.overflow_paths }}'
+          )
+          index=0
+          for wave in "${waves[@]}"; do
+            index=$((index + 1))
+            [ -n "$wave" ] || continue
+            echo "::group::wave $index -- $wave"
+            mvn clean install \
+              --batch-mode --no-transfer-progress \
+              -T 1C \
+              -pl "$wave"
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 4. One required status check that reflects the whole pipeline, whichever
+  #    build mode ran and however many waves were skipped as empty.
+  # ---------------------------------------------------------------------------
+  pipeline-result:
+    name: Pipeline result
+    needs:
+      - resolver-tests
+      - plan
+      - wave-1
+      - wave-2
+      - wave-3
+      - wave-4
+      - wave-5
+      - wave-6
+      - wave-overflow
+      - single-runner-build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise
+        run: |
+          echo "scenario        : ${{ needs.plan.outputs.scenario }}"
+          echo "modules in plan : ${{ needs.plan.outputs.module_count }} of ${{ needs.plan.outputs.module_total }}"
+          echo "directly changed: ${{ needs.plan.outputs.changed_count }}"
+          echo "skipped         : ${{ needs.plan.outputs.skipped_count }}"
+          echo "waves           : ${{ needs.plan.outputs.wave_count }}"
+          echo "compiled        : ${{ needs.plan.outputs.should_build }} (mode ${{ needs.plan.outputs.build_mode }})"
+
+          {
+            echo "### Pipeline result"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Scenario | \`${{ needs.plan.outputs.scenario }}\` |"
+            echo "| Modules built | ${{ needs.plan.outputs.module_count }} of ${{ needs.plan.outputs.module_total }} |"
+            echo "| Waves | ${{ needs.plan.outputs.wave_count }} |"
+            echo "| Compiled | ${{ needs.plan.outputs.should_build }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if the resolver tests failed
+        if: needs.resolver-tests.result != 'success'
+        run: |
+          echo "::error::the resolver test suite did not pass; the build plan cannot be trusted"
+          exit 1
+
+      - name: Fail if the plan job failed
+        if: needs.plan.result != 'success'
+        run: |
+          echo "::error::the planning job did not succeed"
+          exit 1
+
+      - name: Fail if any build wave failed
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::at least one build wave failed"
+          exit 1

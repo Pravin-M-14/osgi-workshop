@@ -1,0 +1,122 @@
+name: Build one OMS module
+description: >
+  Builds a single Tycho module on a fresh runner, wiring up the two caches a
+  partial OSGi reactor needs: the shared p2 target platform, and the artifacts
+  produced by earlier dependency waves.
+
+inputs:
+  module:
+    description: Bundle symbolic name or feature id (used for artifact naming and logs)
+    required: true
+  path:
+    description: Reactor-relative path of the module, passed to Maven's -pl
+    required: true
+  wave:
+    description: Dependency wave number this module belongs to
+    required: true
+  java-version:
+    description: JDK version; the product declares JavaSE-17
+    required: false
+    default: "17"
+  goals:
+    description: Maven goals. `install` matters -- later waves resolve from the local repo.
+    required: false
+    default: clean install
+  reactor-root:
+    description: Directory holding the aggregator pom.xml
+    required: false
+    default: osgi-workshop
+  maven-args:
+    description: Extra arguments appended to the Maven command line
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java-version }}
+
+    # The p2 target platform (Eclipse 2023-12) is by far the slowest part of a
+    # Tycho build and it is identical for every module, so it gets a stable
+    # cache key shared across the whole run and across runs.
+    - name: Restore Maven and Tycho p2 caches
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.m2/repository
+          ~/.m2/wrapper
+        key: oms-m2-${{ runner.os }}-${{ hashFiles(format('{0}/pom.xml', inputs.reactor-root)) }}
+        restore-keys: |
+          oms-m2-${{ runner.os }}-
+
+    # Artifacts built by earlier waves. Each upstream job tars the product's
+    # own subtree of the local repository; we unpack every one we can find.
+    # A tarball rather than a raw directory upload keeps the layout explicit
+    # instead of relying on the artifact action's common-ancestor guessing.
+    - name: Download artifacts from earlier waves
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        pattern: oms-m2-w*
+        path: /tmp/oms-m2-in
+        merge-multiple: true
+
+    - name: Restore artifacts from earlier waves
+      shell: bash
+      run: |
+        mkdir -p ~/.m2/repository
+        shopt -s nullglob
+        restored=0
+        for archive in /tmp/oms-m2-in/*.tgz; do
+          tar -xzf "$archive" -C ~/.m2/repository
+          restored=$((restored + 1))
+        done
+        echo "restored $restored upstream artifact bundle(s) into the local repository"
+
+    - name: Build ${{ inputs.module }}
+      shell: bash
+      working-directory: ${{ inputs.reactor-root }}
+      run: |
+        echo "::group::wave ${{ inputs.wave }} :: ${{ inputs.module }}"
+        echo "module : ${{ inputs.module }}"
+        echo "path   : ${{ inputs.path }}"
+        echo "goals  : ${{ inputs.goals }}"
+        set -o pipefail
+        mvn ${{ inputs.goals }} \
+          --batch-mode \
+          --no-transfer-progress \
+          -pl '${{ inputs.path }}' \
+          ${{ inputs.maven-args }}
+        echo "::endgroup::"
+
+    # Hand this module's output forward. Only the product's own group is
+    # transferred; third-party and p2 content travels via the cache above.
+    # hashFiles() can only see paths inside GITHUB_WORKSPACE, so the presence
+    # of the tarball is reported through a step output instead.
+    - name: Package output for downstream waves
+      id: package
+      shell: bash
+      run: |
+        mkdir -p /tmp/oms-m2-out
+        if [ -d "$HOME/.m2/repository/com/northwind" ]; then
+          tar -czf "/tmp/oms-m2-out/${{ inputs.module }}.tgz" \
+            -C "$HOME/.m2/repository" com/northwind
+          echo "packaged $(du -h "/tmp/oms-m2-out/${{ inputs.module }}.tgz" | cut -f1)"
+          echo "packaged=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "no com/northwind artifacts produced; nothing to hand forward"
+          echo "packaged=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload output for downstream waves
+      if: steps.package.outputs.packaged == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: oms-m2-w${{ inputs.wave }}-${{ inputs.module }}
+        path: /tmp/oms-m2-out/*.tgz
+        retention-days: 1
+        if-no-files-found: ignore
