@@ -8,6 +8,7 @@ Stdlib ``unittest`` only, so CI can run these with no pip install:
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -674,10 +675,13 @@ class ReadmeTests(unittest.TestCase):
     and the README is the first thing a reviewer reads.
     """
 
-    README = REPO_ROOT / "build-pipeline" / "README.md"
+    READMES = (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "build-pipeline" / "README.md",
+    )
 
-    def test_documented_commands_parse(self):
-        text = self.README.read_text(encoding="utf-8")
+    @staticmethod
+    def _commands_in(text: str) -> list[str]:
         commands, buffer = [], ""
         for line in text.splitlines():
             stripped = line.strip()
@@ -691,15 +695,88 @@ class ReadmeTests(unittest.TestCase):
                     buffer = stripped.rstrip("\\")
                 else:
                     commands.append(stripped)
+        return commands
 
-        self.assertGreaterEqual(len(commands), 5, "README documents no commands")
-        for command in commands:
-            argv = shlex.split(command.split("#", 1)[0])[1:]  # drop the launcher
-            with self.subTest(command=command):
-                try:
-                    cli.parse_args(argv)
-                except SystemExit as exit_error:  # argparse rejected it
-                    self.fail(f"README documents an invalid command: {command}\n{exit_error}")
+    def test_documented_commands_parse(self):
+        for readme in self.READMES:
+            commands = self._commands_in(readme.read_text(encoding="utf-8"))
+            self.assertGreaterEqual(
+                len(commands), 4, f"{readme.name} documents almost no commands"
+            )
+            for command in commands:
+                argv = shlex.split(command.split("#", 1)[0])[1:]  # drop the launcher
+                with self.subTest(readme=readme.name, command=command):
+                    try:
+                        cli.parse_args(argv)
+                    except SystemExit as exit_error:  # argparse rejected it
+                        self.fail(
+                            f"{readme.name} documents an invalid command: "
+                            f"{command}\n{exit_error}"
+                        )
+
+    def test_root_readme_documents_the_workflow_jobs_that_exist(self):
+        """The root README is the operator guide; its job names must be real."""
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "build-pipeline.yml"
+        ).read_text(encoding="utf-8")
+        for job in ("resolver-tests", "plan", "wave-overflow",
+                    "single-runner-build", "pipeline-result"):
+            with self.subTest(job=job):
+                self.assertIn(job, readme, f"README omits the {job} job")
+                self.assertIn(f"\n  {job}:", workflow, f"{job} is not a real job")
+
+    def test_root_readme_dispatch_inputs_exist(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "build-pipeline.yml"
+        ).read_text(encoding="utf-8")
+        for name in ("scenario", "build_mode", "plan_only", "base_ref"):
+            with self.subTest(input=name):
+                self.assertIn(f"`{name}`", readme)
+                self.assertIn(f"\n      {name}:", workflow)
+
+    def test_root_readme_leaves_the_assignment_brief_in_place(self):
+        """The brief is the assessment team's file and must not be replaced."""
+        brief = (REPO_ROOT / "osgi-workshop" / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Assignment", brief)
+        root = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotEqual(
+            root.strip(), brief.strip(), "the root README duplicates the brief"
+        )
+        self.assertIn("osgi-workshop/README.md", root, "root README must link the brief")
+
+    def test_documented_test_count_matches_reality(self):
+        """Both READMEs quote a test count, in prose and in the workflow table.
+
+        Nobody remembers to update a number in prose when they add a test, so
+        the number rots and a reader who checks it stops trusting the rest of
+        the document. Counting the loaded suite keeps it honest.
+        """
+        # No ``top_level_dir``: the tests directory is deliberately not a
+        # package, so naming a parent as the top level makes it unimportable.
+        # Letting it default to ``start_dir`` is what the documented command
+        # line does too, so this counts exactly what CI runs.
+        suite = unittest.defaultTestLoader.discover(
+            start_dir=str(Path(__file__).resolve().parent)
+        )
+
+        def count(item) -> int:
+            if isinstance(item, unittest.TestSuite):
+                return sum(count(child) for child in item)
+            return 1
+
+        total = count(suite)
+        for readme in self.READMES:
+            text = readme.read_text(encoding="utf-8")
+            quoted = {int(n) for n in re.findall(r"\b(\d+) (?:unit )?tests\b", text)}
+            with self.subTest(readme=readme.name):
+                self.assertTrue(quoted, f"{readme.name} quotes no test count")
+                self.assertEqual(
+                    quoted,
+                    {total},
+                    f"{readme.name} says {sorted(quoted)} tests; the suite has {total}",
+                )
 
 
 if __name__ == "__main__":
