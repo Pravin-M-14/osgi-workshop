@@ -78,6 +78,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      # The resolver itself is stdlib-only by design. PyYAML is needed solely to
+      # assert that the workflow YAML parses and grants the right permissions,
+      # and setup-python provides a bare interpreter, so it must be installed
+      # explicitly rather than assumed.
+      - name: Install the test-only dependency
+        run: python -m pip install --quiet pyyaml
+
       - name: Byte-compile the resolver
         run: python -m compileall -q build-pipeline/omsbuild
 
@@ -112,6 +119,14 @@ jobs:
     name: Plan build
     needs: [resolver-tests]
     runs-on: ubuntu-latest
+    # The workflow default is contents:read, which is all every other job needs.
+    # This job additionally posts the impact analysis as a PR comment, and
+    # `issues.createComment` on a pull request requires pull-requests:write.
+    # Without this block the comment step fails with a 403 -- and only on real
+    # pull requests, so it would not show up in a dispatch smoke test.
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       scenario: ${{ steps.plan.outputs.scenario }}
       should_build: ${{ steps.gate.outputs.should_build }}

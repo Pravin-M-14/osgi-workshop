@@ -593,6 +593,42 @@ class WorkflowContractTests(unittest.TestCase):
         self.workflow_path = REPO_ROOT / ".github/workflows/build-pipeline.yml"
         self.text = self.workflow_path.read_text(encoding="utf-8")
 
+    def test_job_that_comments_on_prs_has_write_permission(self):
+        """A job calling the issues API needs pull-requests:write.
+
+        The workflow default is contents:read. If a job posts a PR comment
+        without widening its own permissions the step fails with a 403, and
+        only on real pull requests -- a workflow_dispatch smoke test passes
+        happily. That makes it exactly the kind of bug worth pinning.
+        """
+        # Imported locally, and skipped rather than failed if absent: the
+        # resolver is deliberately stdlib-only, so a contributor running the
+        # suite on a bare interpreter should not see a spurious failure. CI
+        # installs PyYAML explicitly so the check really does run there.
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover - depends on the environment
+            self.skipTest("PyYAML not installed")
+
+        workflow = yaml.safe_load(self.text)
+        for name, job in workflow["jobs"].items():
+            script_steps = [
+                step
+                for step in job.get("steps", [])
+                if "issues.createComment" in str(step.get("with", {}).get("script", ""))
+                or "issues.updateComment" in str(step.get("with", {}).get("script", ""))
+            ]
+            if not script_steps:
+                continue
+            granted = job.get("permissions") or {}
+            with self.subTest(job=name):
+                self.assertEqual(
+                    granted.get("pull-requests"),
+                    "write",
+                    f"job {name!r} comments on pull requests but does not grant "
+                    "pull-requests:write, so the step will 403",
+                )
+
     def test_workflow_declares_a_job_for_every_ladder_wave(self):
         for wave_index in range(1, ghaction.MAX_WAVES + 1):
             self.assertIn(f"wave-{wave_index}:", self.text)
@@ -770,12 +806,15 @@ class ReadmeTests(unittest.TestCase):
         for readme in self.READMES:
             text = readme.read_text(encoding="utf-8")
             quoted = {int(n) for n in re.findall(r"\b(\d+) (?:unit )?tests\b", text)}
-            with self.subTest(readme=readme.name):
-                self.assertTrue(quoted, f"{readme.name} quotes no test count")
+            # Both files are called README.md, so label the subtest with the
+            # path relative to the repo root or the failure is ambiguous.
+            label = readme.relative_to(REPO_ROOT).as_posix()
+            with self.subTest(readme=label):
+                self.assertTrue(quoted, f"{label} quotes no test count")
                 self.assertEqual(
                     quoted,
                     {total},
-                    f"{readme.name} says {sorted(quoted)} tests; the suite has {total}",
+                    f"{label} says {sorted(quoted)} tests; the suite has {total}",
                 )
 
 

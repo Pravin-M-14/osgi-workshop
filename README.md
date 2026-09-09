@@ -51,7 +51,7 @@ resolver-tests --> plan --> wave-1 --> wave-2 --> ... --> wave-6 --> pipeline-re
 
 | Job | What it does |
 |---|---|
-| `resolver-tests` | Runs the 63 unit tests. Gates `plan`, because a parser bug wouldn't fail the build — it would quietly build the *wrong subset* and report success. |
+| `resolver-tests` | Runs the 64 unit tests. Gates `plan`, because a parser bug wouldn't fail the build — it would quietly build the *wrong subset* and report success. |
 | `plan` | Parses the OSGi metadata, computes the graph, the impact set and the build waves. Emits one job matrix per wave, publishes the graph, comments on the PR. No JDK, no Maven. |
 | `wave-1` … `wave-6` | Build only what the plan handed them, one runner per module, all modules in a wave in parallel. A wave with nothing to do skips itself. |
 | `wave-overflow` | Safety valve if a future change produces more waves than the ladder. |
@@ -281,7 +281,7 @@ The derived graph:
 PYTHONPATH=build-pipeline python3 -m unittest discover -s build-pipeline/tests -v
 ```
 
-63 tests, stdlib only. They cover OSGi manifest parsing edge cases (72-byte line
+64 tests, stdlib only. They cover OSGi manifest parsing edge cases (72-byte line
 folding, commas inside quoted version ranges), proof that the produced order
 satisfies every edge, cycle detection, the impact closure, git merge-base change
 detection, and a contract test keeping the resolver's wave outputs in step with
