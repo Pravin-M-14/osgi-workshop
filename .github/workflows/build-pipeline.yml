@@ -294,9 +294,12 @@ jobs:
             }
 
   # ---------------------------------------------------------------------------
-  # 2. Build. Six wave jobs form a fixed ladder because Actions can fan a job
-  #    out dynamically but cannot create a dynamic *chain* of jobs. Each wave
-  #    skips itself when the plan gave it no modules.
+  # 2. Build. Five wave jobs form a fixed ladder -- one rung per wave this
+  #    product actually has -- because Actions can fan a job out dynamically
+  #    (`matrix: fromJSON(...)`) but cannot create a dynamic *chain* of jobs:
+  #    `needs:` is literal YAML, evaluated before the resolver has run. Each
+  #    wave skips itself when the plan gave it no modules, and anything deeper
+  #    than the ladder goes to `deep-graph-fallback` below.
   #
   #    The `!cancelled() && !contains(needs.*.result, 'failure')` guard is what
   #    lets a wave run when an earlier wave was skipped (empty) rather than
@@ -463,6 +466,8 @@ jobs:
 
       - name: Build each wave in dependency order
         working-directory: ${{ env.REACTOR_ROOT }}
+        env:
+          EXPECTED_PATHS: ${{ needs.plan.outputs.all_module_paths }}
         run: |
           set -o pipefail
           waves=(
@@ -473,17 +478,99 @@ jobs:
             '${{ needs.plan.outputs.wave5_paths }}'
             '${{ needs.plan.outputs.overflow_paths }}'
           )
+
+          # Matrix mode gets module-level accounting for free: one row per
+          # module in the Actions UI. This mode packs everything into one job,
+          # so the log has to supply that accounting itself -- otherwise there
+          # is no way to tell a 20-module build from a 19-module one until
+          # something unrelated breaks much later. State the contract up front.
+          total=$(tr ',' '\n' <<<"$EXPECTED_PATHS" | grep -c . || true)
+          echo "--- Modules this job must build ($total) -----------------------------------"
+          tr ',' '\n' <<<"$EXPECTED_PATHS" | nl -w3 -s'  '
+          echo
+
           index=0
           for wave in "${waves[@]}"; do
             index=$((index + 1))
-            [ -n "$wave" ] || continue
-            echo "::group::wave $index -- $wave"
+            if [ -z "$wave" ]; then
+              echo "Wave $index: empty, nothing to build"
+              continue
+            fi
+            count=$(tr ',' '\n' <<<"$wave" | grep -c . || true)
+            echo "::group::Wave $index of ${{ needs.plan.outputs.wave_count }} -- $count module(s)"
+            tr ',' '\n' <<<"$wave" | sed 's/^/  queued: /'
             mvn clean install \
               --batch-mode --no-transfer-progress \
               -T 1C \
               -pl "$wave"
+
+            # Check this wave landed before the next one resolves against it.
+            # Maven exiting 0 is not quite the same claim: a module silently
+            # missing from the reactor would not fail here, it would fail as an
+            # unresolvable dependency one wave later, pointing at the consumer
+            # instead of the real gap.
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              jar=$(ls "$path"/target/*.jar 2>/dev/null | head -1 || true)
+              if [ -n "$jar" ]; then
+                echo "  built : $path -> $(basename "$jar")"
+              else
+                echo "::error::$path produced no JAR in wave $index"
+                exit 1
+              fi
+            done < <(tr ',' '\n' <<<"$wave")
             echo "::endgroup::"
           done
+
+      # A separate step so it shows as its own green/red line, and so it runs
+      # over the whole plan rather than one wave at a time.
+      - name: Verify every planned module produced an artifact
+        working-directory: ${{ env.REACTOR_ROOT }}
+        env:
+          EXPECTED_PATHS: ${{ needs.plan.outputs.all_module_paths }}
+        run: |
+          echo "--- Build verification ------------------------------------------------"
+          {
+            echo "### Single-runner build verification"
+            echo
+            echo "| # | Module | Artifact |"
+            echo "|--:|--------|----------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          planned=0; built=0; missing=0
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            planned=$((planned + 1))
+            jar=$(ls "$path"/target/*.jar 2>/dev/null | head -1 || true)
+            if [ -n "$jar" ]; then
+              built=$((built + 1))
+              printf '  %2d  ok       %s -> %s\n' "$planned" "$path" "$(basename "$jar")"
+              echo "| $planned | \`$path\` | \`$(basename "$jar")\` |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              missing=$((missing + 1))
+              printf '  %2d  MISSING  %s\n' "$planned" "$path"
+              echo "| $planned | \`$path\` | **missing** |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < <(tr ',' '\n' <<<"$EXPECTED_PATHS")
+
+          echo
+          echo "  planned : $planned"
+          echo "  built   : $built"
+          echo "  missing : $missing"
+          {
+            echo
+            echo "**$built of $planned planned modules produced an artifact.**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$planned" -eq 0 ]; then
+            echo "::error::the plan listed no modules; that should not reach this job"
+            exit 1
+          fi
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing of $planned planned modules produced no artifact"
+            exit 1
+          fi
+          echo "::notice::all $planned planned modules built"
 
   # ---------------------------------------------------------------------------
   # 4. One required status check that reflects the whole pipeline, whichever

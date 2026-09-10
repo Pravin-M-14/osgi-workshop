@@ -197,13 +197,44 @@ every `oms-m2-w*` bundle they can find. The p2 target platform — by far the
 slowest part of a Tycho build and identical for every module — travels
 separately via `actions/cache` keyed on the root POM hash.
 
-For 20 tiny bundles that hand-off overhead probably costs more than the
-parallelism saves, and `single-runner-build` (one runner, waves sequential,
-`mvn -T 1C` within each) is likely faster. Both are implemented and selectable
-via the `build_mode` dispatch input, so the trade-off can be **measured on the
-real runners rather than argued about**. Matrix mode is the default because
-this assignment is about making the dependency reasoning visible, and one job
-per module is the clearest possible display of it.
+For 20 tiny bundles that hand-off overhead costs more than the parallelism
+saves. Measured on the real runners: an individual matrix module takes 19–29s
+once its runner has set up a JDK, restored the cache and unpacked the upstream
+tarballs, while `single-runner-build` compiles **all twenty in 59s**. One
+matrix module costs roughly half the entire single-runner build. Both modes are
+implemented and selectable via the `build_mode` dispatch input, so the
+trade-off is **measured rather than argued about**. Matrix mode remains the
+default because this assignment is about making the dependency reasoning
+visible, and one job per module is the clearest possible display of it.
+
+**Why single-runner mode asserts its own module count.** Matrix mode gets
+module-level accounting for free — twenty rows in the Actions UI, one per
+module, each individually green or red. Single-runner mode packs the same work
+into one job, and that loses the accounting: a build that compiled 19 of 20
+modules looks exactly like one that compiled 20, because Maven exits 0 either
+way. An empty or short `-pl` list is not a Maven error, it is a smaller
+reactor.
+
+Extra log output alone does not fix this, because it still leaves a human
+counting lines. So the job asserts instead. It opens by printing the contract
+it must satisfy (`--- Modules this job must build (20)`, numbered), checks after
+*each wave* that every module in it produced a `target/*.jar`, and then runs a
+separate **Verify every planned module produced an artifact** step that
+reconciles the whole plan and **exits non-zero on any shortfall**. So "did all
+20 build?" is answered by the run's status, not by reading the log.
+
+The per-wave check is not redundant with the final one. It localises the
+failure: a module missing from wave 2 fails *in wave 2*, rather than surfacing
+one wave later as an unresolvable Tycho dependency that points at the innocent
+consumer instead of the real gap.
+
+Two invariants underwrite this, both pinned by tests rather than assumed.
+`waveN_paths` ∪ `overflow_paths` must equal `all_module_paths` exactly and
+without duplicates — the job builds from the former and verifies against the
+latter, so any drift would either fail on a module it was never asked to build
+or, worse, pass having compiled a subset. And every planned module must have
+`eclipse-plugin` or `eclipse-feature` packaging, since a `pom` aggregator
+produces no JAR and would fail the artifact check for no reason.
 
 ---
 
@@ -213,7 +244,7 @@ per module is the clearest possible display of it.
 PYTHONPATH=build-pipeline python3 -m unittest discover -s build-pipeline/tests -v
 ```
 
-68 tests, no third-party dependencies. The ones that matter most:
+71 tests, no third-party dependencies. The ones that matter most:
 
 - **Manifest parsing** — 72-byte line folding, CRLF, commas inside quoted
   version ranges (`version="[1.0.0,2.0.0)"` is one clause, not two),
@@ -222,14 +253,23 @@ PYTHONPATH=build-pipeline python3 -m unittest discover -s build-pipeline/tests -
   proved to partition the graph exactly once with no intra-wave edge, ordering
   is deterministic, and a synthetic cycle is detected and blocks ordering.
 - **Impact** — the assignment's own example (change `core`, `gateway` and
-  `payment`) is reproduced and asserted to select 14 of 20 modules and leave
-  `customer`, `security` and `slf4j` alone, because those are *upstream* of the
-  change and rebuilding them would be waste.
+  `payment`) is reproduced and asserted to select exactly 14 of 20 modules,
+  with the skipped six pinned by name: `customer`, `security` and
+  `tpcl.org.slf4j` plus each of their features. Those are *upstream* of the
+  change, so rebuilding them would be waste.
 - **Git strategy** — against a real temp repository, including that the merge
   base is used so commits landed on `main` after branching don't inflate the
   rebuild set.
 - **Workflow contract** — the resolver's wave outputs and the YAML job ladder
-  cannot drift apart.
+  cannot drift apart; no job reads a plan output the resolver never emits; the
+  matrix hand-off carries the p2 indices; the job that comments on PRs holds
+  `pull-requests: write`.
+- **Single-runner accounting** — `waveN_paths` ∪ `overflow_paths` equals
+  `all_module_paths` exactly and without duplicates, and every planned module
+  has JAR-producing packaging, so the artifact check can neither miss a module
+  nor fail on one that was never going to produce a JAR.
+- **Documentation** — the test count quoted in both READMEs is compared against
+  the number the loader actually discovers, so it cannot rot.
 
 ### End-to-end verification performed
 
@@ -285,7 +325,7 @@ build-pipeline/
     render.py            # DOT/SVG, Mermaid, HTML, ASCII
     ghaction.py          # job matrices, step outputs, job summary, PR comment
     cli.py               # command line
-  tests/test_pipeline.py # 68 tests, stdlib only
+  tests/test_pipeline.py # 71 tests, stdlib only
 .github/
   workflows/build-pipeline.yml
   actions/build-module/action.yml

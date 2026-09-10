@@ -27,6 +27,7 @@ from omsbuild.model import Edge, EdgeKind, Kind, Project  # noqa: E402
 from omsbuild.plan import plan_changed, plan_full  # noqa: E402
 from omsbuild.scan import (  # noqa: E402
     parse_export_header,
+    parse_pom,
     parse_requirement_header,
     parse_symbolic_name,
     scan,
@@ -417,13 +418,27 @@ class ChangeDetectionTests(unittest.TestCase):
                 "com.northwind.oms.payment",
             },
         )
-        # customer / security / slf4j are upstream or unrelated: never rebuilt.
-        for untouched in (
-            "com.northwind.oms.customer",
-            "com.northwind.oms.security",
-            "com.northwind.oms.tpcl.org.slf4j",
-        ):
-            self.assertIn(untouched, plan.skipped_ids)
+        # The headline result both READMEs quote for this exact change set.
+        # Asserted as numbers so a regression in the closure shows up here
+        # rather than as a quietly larger or smaller build.
+        self.assertEqual(len(plan.selected_ids), 14)
+        self.assertEqual(len(plan.skipped_ids), 6)
+
+        # And the skip set exactly -- not just a spot-check. These six are
+        # upstream of the change or unrelated to it, so rebuilding them would
+        # be pure waste; each bundle drags its own feature along, which is why
+        # it is six and not three.
+        self.assertEqual(
+            set(plan.skipped_ids),
+            {
+                "com.northwind.oms.customer",
+                "com.northwind.oms.customer.feature",
+                "com.northwind.oms.security",
+                "com.northwind.oms.security.feature",
+                "com.northwind.oms.tpcl.org.slf4j",
+                "com.northwind.oms.tpcl.slf4j.feature",
+            },
+        )
         # Everything downstream of core must be selected.
         for downstream in (
             "com.northwind.oms.inventory",
@@ -560,6 +575,46 @@ class GitHubActionsOutputTests(unittest.TestCase):
         result = ghaction.outputs(self.plan)
         for entry in json.loads(result["wave1_matrix"])["include"]:
             self.assertTrue((REACTOR / entry["path"] / "pom.xml").is_file())
+
+    def test_wave_paths_cover_all_module_paths_exactly(self):
+        # single-runner mode builds from waveN_paths but verifies against
+        # all_module_paths. If those two views ever disagree the job either
+        # fails on a module it was never asked to build, or -- far worse --
+        # reports success having compiled a subset. The matrix outputs are
+        # already pinned above; these are a separate set of outputs and need
+        # their own guarantee.
+        result = ghaction.outputs(self.plan)
+        from_waves: list[str] = []
+        for wave_index in range(1, ghaction.MAX_WAVES + 1):
+            from_waves.extend(
+                p for p in result[f"wave{wave_index}_paths"].split(",") if p
+            )
+        from_waves.extend(p for p in result["overflow_paths"].split(",") if p)
+
+        expected = [p for p in result["all_module_paths"].split(",") if p]
+        self.assertEqual(sorted(from_waves), sorted(expected))
+        # No module may appear in two waves: it would be built twice, and the
+        # verification step's count would over-report.
+        self.assertEqual(len(from_waves), len(set(from_waves)))
+
+    def test_every_planned_module_is_one_maven_can_produce_a_jar_for(self):
+        # The single-runner verification step proves a module built by looking
+        # for target/*.jar. That is only a valid test if every planned module
+        # actually produces one -- a `pom`-packaging aggregator would not, and
+        # would fail the build for no reason. Aggregators are excluded from the
+        # graph today; this pins that they stay excluded.
+        # Read the packaging off the POM on disk rather than off the model, so
+        # this checks the product itself and not the scanner's opinion of it.
+        producing = {"eclipse-plugin", "eclipse-feature"}
+        for entry in self.plan.entries:
+            pom = parse_pom(REACTOR / entry.rel_path / "pom.xml")
+            packaging = pom.get("packaging")
+            self.assertIn(
+                packaging,
+                producing,
+                f"{entry.project_id} has packaging {packaging!r}, which produces "
+                "no JAR, so the single-runner artifact check would fail on it",
+            )
 
     def test_no_step_output_value_contains_a_newline_unescaped(self):
         # write_outputs uses heredocs for multiline values; verify round-trip.
@@ -890,6 +945,54 @@ class ReadmeTests(unittest.TestCase):
             with self.subTest(input=name):
                 self.assertIn(f"`{name}`", readme)
                 self.assertIn(f"\n      {name}:", workflow)
+
+    def test_readme_log_sections_are_ones_the_resolver_actually_prints(self):
+        """The README tells a reviewer which ``--- X`` sections to look for.
+
+        Those names are the reviewer's index into the verbose logging Part 1
+        asks for, so a rename in ``cli.py`` that leaves the README behind sends
+        them hunting for output that no longer exists. Nothing else would catch
+        it: the resolver keeps working perfectly.
+        """
+        cli_source = (
+            REPO_ROOT / "build-pipeline" / "omsbuild" / "cli.py"
+        ).read_text(encoding="utf-8")
+        # Section headers are emitted as log.section("Name") or
+        # log.section(f"Name (N finding(s))"), so keep the literal prefix.
+        emitted = [
+            match.group(1)
+            for match in re.finditer(r'log\.section\(f?"([^"{]*)', cli_source)
+        ]
+        # Two sections belong to single-runner mode and so are echoed by the
+        # workflow itself rather than the resolver -- that job runs Maven
+        # directly and never calls the CLI.
+        workflow_source = (
+            REPO_ROOT / ".github" / "workflows" / "build-pipeline.yml"
+        ).read_text(encoding="utf-8")
+        emitted += [
+            match.group(1).strip()
+            for match in re.finditer(r'echo "--- ([^"$]*)', workflow_source)
+        ]
+        self.assertGreaterEqual(len(emitted), 8, "found almost no log sections")
+
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        documented = {
+            # Backtick spans wrap across lines in prose, so collapse whitespace
+            # before comparing or the name will not match what is printed.
+            " ".join(name.split())
+            for name in re.findall(r"`--- ([^`(]+?)\s*(?:\([^`]*\))?`", readme)
+        }
+        self.assertGreaterEqual(
+            len(documented), 8, "the README documents almost no log sections"
+        )
+
+        for name in sorted(documented):
+            with self.subTest(section=name):
+                self.assertTrue(
+                    any(header.startswith(name) for header in emitted),
+                    f"the README tells readers to look for '--- {name}', but "
+                    f"no log.section() in cli.py emits it. Emitted: {emitted}",
+                )
 
     def test_root_readme_leaves_the_assignment_brief_in_place(self):
         """The brief is the assessment team's file and must not be replaced."""
