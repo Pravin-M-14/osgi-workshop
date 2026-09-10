@@ -144,7 +144,7 @@ the YAML declarative — the workflow never parses OSGi metadata — by splittin
 the problem in two: one job decides, the rest obey.
 
 ```
-resolver-tests ─► plan ─► wave-1 ─► wave-2 ─► … ─► wave-6 ─► pipeline-result
+resolver-tests ─► plan ─► wave-1 ─► wave-2 ─► … ─► wave-5 ─► pipeline-result
                     │                                            ▲
                     └──────────► single-runner-build ─────────────┘
 ```
@@ -153,8 +153,8 @@ resolver-tests ─► plan ─► wave-1 ─► wave-2 ─► … ─► wave-6 
 |---|---|
 | `resolver-tests` | Runs the unit suite. `plan` gates on it — see below. |
 | `plan` | Runs the resolver, emits one job matrix per wave, publishes the graph and upserts the PR comment. No JDK, no Maven. |
-| `wave-1` … `wave-6` | `matrix: fromJSON(needs.plan.outputs.waveN_matrix)`; one runner per module. Skips itself when its matrix is empty. |
-| `wave-overflow` | Safety valve: builds any wave past the ladder on one runner. |
+| `wave-1` … `wave-5` | `matrix: fromJSON(needs.plan.outputs.waveN_matrix)`; one runner per module. Skips itself when its matrix is empty. |
+| `deep-graph-fallback` | Not a wave. Builds any wave past the ladder in order on one runner. Grey on every normal run; that is the intended state. |
 | `single-runner-build` | Alternative mode; all waves on one runner with `mvn -T`. |
 | `pipeline-result` | One status check reflecting the whole pipeline. |
 
@@ -213,7 +213,7 @@ per module is the clearest possible display of it.
 PYTHONPATH=build-pipeline python3 -m unittest discover -s build-pipeline/tests -v
 ```
 
-66 tests, no third-party dependencies. The ones that matter most:
+68 tests, no third-party dependencies. The ones that matter most:
 
 - **Manifest parsing** — 72-byte line folding, CRLF, commas inside quoted
   version ranges (`version="[1.0.0,2.0.0)"` is one clause, not two),
@@ -285,7 +285,7 @@ build-pipeline/
     render.py            # DOT/SVG, Mermaid, HTML, ASCII
     ghaction.py          # job matrices, step outputs, job summary, PR comment
     cli.py               # command line
-  tests/test_pipeline.py # 66 tests, stdlib only
+  tests/test_pipeline.py # 68 tests, stdlib only
 .github/
   workflows/build-pipeline.yml
   actions/build-module/action.yml

@@ -143,19 +143,16 @@ jobs:
       wave3_matrix: ${{ steps.plan.outputs.wave3_matrix }}
       wave4_matrix: ${{ steps.plan.outputs.wave4_matrix }}
       wave5_matrix: ${{ steps.plan.outputs.wave5_matrix }}
-      wave6_matrix: ${{ steps.plan.outputs.wave6_matrix }}
       wave1_has_work: ${{ steps.plan.outputs.wave1_has_work }}
       wave2_has_work: ${{ steps.plan.outputs.wave2_has_work }}
       wave3_has_work: ${{ steps.plan.outputs.wave3_has_work }}
       wave4_has_work: ${{ steps.plan.outputs.wave4_has_work }}
       wave5_has_work: ${{ steps.plan.outputs.wave5_has_work }}
-      wave6_has_work: ${{ steps.plan.outputs.wave6_has_work }}
       wave1_paths: ${{ steps.plan.outputs.wave1_paths }}
       wave2_paths: ${{ steps.plan.outputs.wave2_paths }}
       wave3_paths: ${{ steps.plan.outputs.wave3_paths }}
       wave4_paths: ${{ steps.plan.outputs.wave4_paths }}
       wave5_paths: ${{ steps.plan.outputs.wave5_paths }}
-      wave6_paths: ${{ steps.plan.outputs.wave6_paths }}
       overflow_has_work: ${{ steps.plan.outputs.overflow_has_work }}
       overflow_paths: ${{ steps.plan.outputs.overflow_paths }}
 
@@ -409,32 +406,22 @@ jobs:
           wave: "5"
           reactor-root: ${{ env.REACTOR_ROOT }}
 
-  wave-6:
-    name: "W6 ${{ matrix.short }}"
+  # Not a wave. This is the safety valve for a graph deeper than the ladder.
+  #
+  # The ladder above has one rung per wave the product actually has. GitHub
+  # cannot grow it on demand -- `needs:` is literal YAML, evaluated before the
+  # resolver has run -- so a change that adds a sixth level of dependencies
+  # would have nowhere to build. This job takes every such wave and builds them
+  # in order on a single runner: slower than fanning out, but correct, and it
+  # is the difference between a slow build and one that silently ships without
+  # compiling its deepest modules.
+  #
+  # It stays grey on every normal run, which is the intended state. The name
+  # says "fallback" rather than a wave number so an idle row in the Actions UI
+  # reads as designed-and-unused rather than broken or skipped by mistake.
+  deep-graph-fallback:
+    name: "Fallback: waves 6+ on one runner (idle unless the graph deepens)"
     needs: [plan, wave-1, wave-2, wave-3, wave-4, wave-5]
-    if: >
-      !cancelled() && !contains(needs.*.result, 'failure') &&
-      needs.plan.outputs.should_build == 'true' &&
-      needs.plan.outputs.build_mode == 'matrix' &&
-      needs.plan.outputs.wave6_has_work == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.plan.outputs.wave6_matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/build-module
-        with:
-          module: ${{ matrix.module }}
-          path: ${{ matrix.path }}
-          wave: "6"
-          reactor-root: ${{ env.REACTOR_ROOT }}
-
-  # Safety valve: if the graph ever grows deeper than the ladder, the remaining
-  # waves are built in order on one runner rather than being silently dropped.
-  wave-overflow:
-    name: "W7+ remaining waves"
-    needs: [plan, wave-1, wave-2, wave-3, wave-4, wave-5, wave-6]
     if: >
       !cancelled() && !contains(needs.*.result, 'failure') &&
       needs.plan.outputs.should_build == 'true' &&
@@ -445,9 +432,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-module
         with:
-          module: overflow
+          module: deep-graph-fallback
           path: ${{ needs.plan.outputs.overflow_paths }}
-          wave: "7"
+          wave: "6"
           reactor-root: ${{ env.REACTOR_ROOT }}
 
   # ---------------------------------------------------------------------------
@@ -484,7 +471,6 @@ jobs:
             '${{ needs.plan.outputs.wave3_paths }}'
             '${{ needs.plan.outputs.wave4_paths }}'
             '${{ needs.plan.outputs.wave5_paths }}'
-            '${{ needs.plan.outputs.wave6_paths }}'
             '${{ needs.plan.outputs.overflow_paths }}'
           )
           index=0
@@ -513,8 +499,7 @@ jobs:
       - wave-3
       - wave-4
       - wave-5
-      - wave-6
-      - wave-overflow
+      - deep-graph-fallback
       - single-runner-build
     if: always()
     runs-on: ubuntu-latest

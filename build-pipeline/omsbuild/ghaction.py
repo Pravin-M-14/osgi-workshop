@@ -24,11 +24,22 @@ from .model import ChangeReason, Kind
 from .plan import BuildPlan
 from .render import to_mermaid
 
-#: Length of the fixed wave-job ladder declared in the workflow.  The current
-#: product resolves to five waves; six gives headroom.  A plan deeper than this
-#: is still built correctly -- the overflow waves are handed to a final job
-#: that builds them in order on a single runner.
-MAX_WAVES = 6
+#: Length of the fixed wave-job ladder declared in the workflow, which must
+#: match it exactly -- ``test_the_ladder_is_exactly_as_long_as_MAX_WAVES``
+#: enforces that in both directions.
+#:
+#: Set to the depth the product actually resolves to (five) rather than padded
+#: with spare rungs. A spare rung can never run for this product, so it only
+#: shows up as a permanently grey row in the Actions UI captioned with an
+#: unevaluated ``${{ matrix.short }}`` -- GitHub does not evaluate job names
+#: for a matrix that never instantiated -- which reads as a broken job rather
+#: than an unused one.
+#:
+#: Depth beyond this is still built correctly: those waves go to the
+#: deep-graph-fallback job, which builds them in order on a single runner.
+#: Losing fan-out there costs little, since for a reactor this size one runner
+#: walking the waves is already the faster mode.
+MAX_WAVES = 5
 
 
 #: Exactly the keys the wave jobs read out of ``matrix``. Every key placed in a

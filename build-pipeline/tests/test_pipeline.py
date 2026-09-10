@@ -638,6 +638,77 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("overflow_has_work", self.text)
         self.assertIn("overflow_paths", self.text)
 
+    def test_the_ladder_is_exactly_as_long_as_MAX_WAVES(self):
+        """No missing rungs, and no stale extra ones either.
+
+        GitHub cannot build a dynamic chain of jobs -- `needs:` is literal in
+        the YAML -- so the wave ladder is a fixed set of self-skipping rungs
+        that has to be kept in step with MAX_WAVES by hand. A missing rung
+        would push work into the sequential overflow job, which is merely
+        slower. A leftover rung after lowering MAX_WAVES is worse: the
+        resolver stops emitting waveN_matrix, so `fromJSON('')` fails at
+        runtime, and only for the one build deep enough to reach it.
+        """
+        rungs = sorted(int(n) for n in re.findall(r"\n  wave-(\d+):", self.text))
+        self.assertEqual(
+            rungs,
+            list(range(1, ghaction.MAX_WAVES + 1)),
+            f"the YAML declares wave rungs {rungs} but MAX_WAVES is "
+            f"{ghaction.MAX_WAVES}",
+        )
+        # The fallback's label must name the first wave it covers, or the
+        # Actions UI tells the reader the wrong thing.
+        self.assertIn(
+            f"waves {ghaction.MAX_WAVES + 1}+",
+            self.text,
+            "the deep-graph-fallback name does not match MAX_WAVES",
+        )
+        # It must also gate on every rung, or it could start early.
+        needs = ", ".join(f"wave-{i}" for i in range(1, ghaction.MAX_WAVES + 1))
+        self.assertIn(f"needs: [plan, {needs}]", self.text)
+
+    def test_no_job_reads_a_plan_output_the_resolver_never_emits(self):
+        """A dangling `needs.plan.outputs.X` is silent, not loud.
+
+        GitHub resolves an unknown output to the empty string rather than
+        erroring, so a leftover reference after shrinking the ladder would give
+        `fromJSON('')` in a matrix or an empty `-pl` in a build -- either a
+        crash deep in a rarely-reached job, or a build that quietly does less
+        than it claims. This checks every reference against what the resolver
+        actually produces.
+        """
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover - depends on the environment
+            self.skipTest("PyYAML not installed")
+
+        declared = yaml.safe_load(self.text)["jobs"]["plan"]["outputs"]
+        referenced = set(re.findall(r"needs\.plan\.outputs\.([a-z0-9_]+)", self.text))
+        self.assertTrue(referenced, "no plan outputs referenced; test is not working")
+
+        undeclared = referenced - set(declared)
+        self.assertEqual(
+            undeclared, set(), "the workflow reads plan outputs that are not declared"
+        )
+
+        # Of the declared outputs, only those wired to the resolver step have to
+        # exist in the resolver's output dict. The rest (should_build,
+        # build_mode) are computed by the workflow's own gate step and are
+        # legitimately absent from it.
+        reactor = scan(REACTOR)
+        emitted = set(ghaction.outputs(plan_full(reactor, build_graph(reactor))))
+        from_resolver = {
+            name
+            for name, expression in declared.items()
+            if "steps.plan.outputs." in expression
+        }
+        self.assertTrue(from_resolver, "no output is wired to the resolver step")
+        self.assertEqual(
+            from_resolver - emitted,
+            set(),
+            "the plan job forwards resolver outputs that the resolver never emits",
+        )
+
     def test_matrix_entries_carry_exactly_the_keys_the_workflow_reads(self):
         """The matrix is a contract; drift in either direction is a bug.
 
@@ -804,7 +875,7 @@ class ReadmeTests(unittest.TestCase):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "build-pipeline.yml"
         ).read_text(encoding="utf-8")
-        for job in ("resolver-tests", "plan", "wave-overflow",
+        for job in ("resolver-tests", "plan", "deep-graph-fallback",
                     "single-runner-build", "pipeline-result"):
             with self.subTest(job=job):
                 self.assertIn(job, readme, f"README omits the {job} job")
