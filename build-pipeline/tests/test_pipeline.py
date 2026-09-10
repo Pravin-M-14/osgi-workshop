@@ -638,6 +638,32 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("overflow_has_work", self.text)
         self.assertIn("overflow_paths", self.text)
 
+    def test_matrix_entries_carry_exactly_the_keys_the_workflow_reads(self):
+        """The matrix is a contract; drift in either direction is a bug.
+
+        A key emitted but never read is dead weight that still lands in the
+        job's auto-generated display name. A key read but never emitted is far
+        worse: `matrix.missing` quietly evaluates to the empty string, so
+        Maven would be invoked with an empty `-pl` and build the wrong thing
+        without erroring.
+        """
+        consumed = set(re.findall(r"matrix\.([a-z_]+)", self.text))
+        self.assertEqual(
+            consumed,
+            set(ghaction.MATRIX_KEYS),
+            "the workflow's matrix.* references and MATRIX_KEYS disagree",
+        )
+
+        reactor = scan(REACTOR)
+        plan = plan_full(reactor, build_graph(reactor))
+        matrix = json.loads(ghaction.outputs(plan)["wave1_matrix"])
+        self.assertTrue(matrix["include"], "wave 1 should never be empty")
+        for entry in matrix["include"]:
+            self.assertEqual(set(entry), set(ghaction.MATRIX_KEYS))
+            for key, value in entry.items():
+                with self.subTest(key=key):
+                    self.assertTrue(value, f"{key} is empty; -pl would misfire")
+
     def test_matrix_handoff_carries_the_p2_indices(self):
         """The inter-wave tarball must include ~/.m2/repository/.meta.
 

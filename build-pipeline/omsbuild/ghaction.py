@@ -31,6 +31,16 @@ from .render import to_mermaid
 MAX_WAVES = 6
 
 
+#: Exactly the keys the wave jobs read out of ``matrix``. Every key placed in a
+#: matrix entry becomes part of that job's identity and its auto-generated
+#: display name in the Actions UI, so carrying fields nobody consumes is not
+#: free -- it is dead surface in the contract between the resolver and the
+#: workflow. ``MatrixContractTests`` checks this set against the ``matrix.*``
+#: references in the YAML, so adding a key here without using it, or using one
+#: in the workflow without emitting it, both fail loudly.
+MATRIX_KEYS = ("module", "short", "path")
+
+
 def _matrix_for(plan: BuildPlan, wave_index: int) -> dict:
     """Matrix entries for one wave: one entry per module in that wave."""
     if wave_index > len(plan.waves):
@@ -43,8 +53,6 @@ def _matrix_for(plan: BuildPlan, wave_index: int) -> dict:
                 "module": project_id,
                 "short": project.short_id,
                 "path": project.rel_path,
-                "kind": str(project.kind),
-                "component": project.component,
             }
         )
     return {"include": include}

@@ -213,7 +213,7 @@ per module is the clearest possible display of it.
 PYTHONPATH=build-pipeline python3 -m unittest discover -s build-pipeline/tests -v
 ```
 
-65 tests, no third-party dependencies. The ones that matter most:
+66 tests, no third-party dependencies. The ones that matter most:
 
 - **Manifest parsing** — 72-byte line folding, CRLF, commas inside quoted
   version ranges (`version="[1.0.0,2.0.0)"` is one clause, not two),
@@ -285,7 +285,7 @@ build-pipeline/
     render.py            # DOT/SVG, Mermaid, HTML, ASCII
     ghaction.py          # job matrices, step outputs, job summary, PR comment
     cli.py               # command line
-  tests/test_pipeline.py # 65 tests, stdlib only
+  tests/test_pipeline.py # 66 tests, stdlib only
 .github/
   workflows/build-pipeline.yml
   actions/build-module/action.yml
