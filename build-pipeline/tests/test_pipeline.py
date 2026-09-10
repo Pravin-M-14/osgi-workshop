@@ -638,6 +638,28 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("overflow_has_work", self.text)
         self.assertIn("overflow_paths", self.text)
 
+    def test_matrix_handoff_carries_the_p2_indices(self):
+        """The inter-wave tarball must include ~/.m2/repository/.meta.
+
+        Tycho resolves eclipse-plugin dependencies from the target platform,
+        not from the Maven local repository, and locally installed Tycho
+        artifacts are only discoverable via the p2 indices under `.meta`.
+        Handing forward `com/northwind` alone gives the downstream runner the
+        JAR while leaving it invisible, which fails as "artifact ... was not
+        found in the target platform" -- pointing at the consumer rather than
+        at the missing index, so it is a genuinely expensive bug to rediscover.
+        """
+        action = (
+            REPO_ROOT / ".github" / "actions" / "build-module" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".meta", action, "the hand-off drops the p2 indices")
+        self.assertIn(
+            "sort -u",
+            action,
+            "the p2 indices must be merged, not overwritten: a plain extract "
+            "lets the last wave archive hide every sibling module",
+        )
+
     def test_plan_job_exposes_every_output_the_waves_consume(self):
         reactor = scan(REACTOR)
         graph = build_graph(reactor)

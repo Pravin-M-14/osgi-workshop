@@ -68,13 +68,37 @@ runs:
     - name: Restore artifacts from earlier waves
       shell: bash
       run: |
-        mkdir -p ~/.m2/repository
         shopt -s nullglob
+        repo="$HOME/.m2/repository"
+        mkdir -p "$repo/com" "$repo/.meta"
+
+        staging=$(mktemp -d)
         restored=0
         for archive in /tmp/oms-m2-in/*.tgz; do
-          tar -xzf "$archive" -C ~/.m2/repository
+          slot="$staging/$restored"
+          mkdir -p "$slot"
+          tar -xzf "$archive" -C "$slot"
+          # Each module owns a disjoint subtree, so copying unions them.
+          [ -d "$slot/com" ] && cp -a "$slot/com/." "$repo/com/"
           restored=$((restored + 1))
         done
+
+        # The p2 indices must be MERGED, not overwritten. Every upstream job
+        # holds only a partial view of the local repository, so letting a plain
+        # `tar -x` run them over each other means the last archive wins and
+        # every sibling module silently vanishes from the target platform --
+        # which surfaces much later as "artifact ... was not found in the target
+        # platform" for a bundle that demonstrably built fine one wave earlier.
+        for index in p2-artifacts.properties p2-local-metadata.properties; do
+          target="$repo/.meta/$index"
+          sources=( "$staging"/*/.meta/"$index" )
+          [ -f "$target" ] && sources+=( "$target" )
+          [ ${#sources[@]} -gt 0 ] || continue
+          grep -hv '^#' "${sources[@]}" | sort -u > "$target.tmp" || true
+          mv "$target.tmp" "$target"
+          echo "merged $(wc -l < "$target") entry/entries into .meta/$index"
+        done
+
         echo "restored $restored upstream artifact bundle(s) into the local repository"
 
     - name: Build ${{ inputs.module }}
@@ -95,6 +119,15 @@ runs:
 
     # Hand this module's output forward. Only the product's own group is
     # transferred; third-party and p2 content travels via the cache above.
+    #
+    # `.meta` is not optional. Tycho resolves eclipse-plugin and
+    # eclipse-feature dependencies from the target platform, which is built
+    # from p2 sources plus the current reactor -- NOT from the Maven local
+    # repository the way an ordinary Maven dependency would be. A Tycho
+    # `install` makes its output discoverable by recording it in the p2 indices
+    # under ~/.m2/repository/.meta/. Ship com/northwind without those indices
+    # and the downstream runner has the JAR on disk but cannot see it at all.
+    #
     # hashFiles() can only see paths inside GITHUB_WORKSPACE, so the presence
     # of the tarball is reported through a step output instead.
     - name: Package output for downstream waves
@@ -102,10 +135,18 @@ runs:
       shell: bash
       run: |
         mkdir -p /tmp/oms-m2-out
-        if [ -d "$HOME/.m2/repository/com/northwind" ]; then
+        repo="$HOME/.m2/repository"
+        if [ -d "$repo/com/northwind" ]; then
+          paths=(com/northwind)
+          if [ -d "$repo/.meta" ]; then
+            paths+=(.meta)
+          else
+            echo "::warning::no p2 indices in the local repository; downstream" \
+                 "waves may not be able to resolve this module"
+          fi
           tar -czf "/tmp/oms-m2-out/${{ inputs.module }}.tgz" \
-            -C "$HOME/.m2/repository" com/northwind
-          echo "packaged $(du -h "/tmp/oms-m2-out/${{ inputs.module }}.tgz" | cut -f1)"
+            -C "$repo" "${paths[@]}"
+          echo "packaged ${paths[*]} ($(du -h "/tmp/oms-m2-out/${{ inputs.module }}.tgz" | cut -f1))"
           echo "packaged=true" >> "$GITHUB_OUTPUT"
         else
           echo "no com/northwind artifacts produced; nothing to hand forward"
