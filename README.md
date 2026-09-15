@@ -612,3 +612,48 @@ because the bundle is present in the workspace when Tycho resolves. It is an
 installation-time problem: a p2 install of any of those features alone can pick a
 different slf4j or fail to resolve. The pipeline reports these rather than
 failing on them, since they are pre-existing.
+
+## Scaling: adding new modules is automatic, not configured
+
+Nothing about this pipeline is aware of the product's 20 modules by name.
+There is no config file, constant, or list anywhere that enumerates
+`core`, `gateway`, `payment`, and so on — every module, edge, and wave is
+**derived fresh from the manifests on every run**:
+
+- **Discovery** (`scan.py`) walks the `<modules>` tree recursively from the
+  root POM. Add a new plugin or feature and wire it into its parent's
+  `<modules>` list with a `MANIFEST.MF` or `feature.xml` in place, and the
+  very next `oms-build modules` / `graph` / `build` invocation picks it up —
+  no code change.
+- **Edges** (`graph.py`) are recomputed the same way: every `Import-Package`
+  / `Require-Bundle` / `<import feature=…>` header is re-read and re-indexed
+  against every `Export-Package` on every run, so a new module's
+  dependencies (and anything that starts depending on it) are captured
+  automatically.
+- **Waves** fall out of that graph via Kahn's algorithm — they are an
+  *output*, not a target. Today wave 1 happens to hold 4 modules
+  (`core`, `customer`, `security`, `tpcl.org.slf4j`) purely because those
+  are the only four with zero dependencies inside this reactor. A new
+  dependency-free module would join wave 1 and make it 5; a new module
+  with a fresh dependency chain could add a 6th wave. Nothing about the
+  resolver assumes 4, or 20 modules, or 5 waves.
+
+**The one place with a fixed number is the CI ladder, and it's a GitHub
+Actions limitation, not a resolver limitation.** Actions can fan a job
+*out* dynamically (`matrix: fromJSON(...)`) but cannot create a dynamic
+*chain* of jobs, so the workflow declares a fixed ladder of wave jobs sized
+to how deep this product's graph resolves today (`MAX_WAVES = 5` in
+`ghaction.py`). If new modules push the real graph past 5 waves:
+
+- Waves 1–5 still run on the dynamic matrix ladder, exactly as now.
+- Any wave beyond 5 is handled by `deep-graph-fallback`, which builds the
+  overflow waves in order on a single runner — correct, just not
+  parallelised.
+- `WorkflowContractTests` in the test suite asserts the YAML ladder length
+  and `MAX_WAVES` stay in sync, so a mismatch fails a test instead of
+  silently dropping a wave.
+
+Raising `MAX_WAVES` (and adding the matching `wave-N` block to the
+workflow YAML) restores full parallel fan-out at greater depth; it is the
+only manual step scaling this product further would ever require, and it
+is about CI job topology, not about the dependency resolution itself.
